@@ -1,7 +1,16 @@
 console.log("✅ chat.js loaded");
 
+let messageEventCount = 0;
+let socketConnectCount = 0;
 
 const socket = io();
+console.log('[DEBUG] Socket connection established');
+socketConnectCount++;
+
+socket.on('connect', () => {
+  socketConnectCount++;
+  console.log(`[DEBUG] Socket connected (${socketConnectCount} times):`, socket.id);
+});
 
 // DOM elements
 const serverSidebar = document.getElementById('server-sidebar');
@@ -30,6 +39,26 @@ const addChannelModal = document.getElementById('add-channel-modal');
 const addChannelName = document.getElementById('add-channel-name');
 const addChannelSave = document.getElementById('add-channel-save');
 const addChannelCancel = document.getElementById('add-channel-cancel');
+
+const clearChatBtn = document.getElementById('clear-chat-btn');
+
+clearChatBtn.addEventListener('click', () => {
+  if (!currentServer || !currentChannel) {
+    alert('Please select a server and channel before clearing chat.');
+    return;
+  }
+  // Clear local message history and UI for current channel
+  clearMessageHistoryForCurrentChannel();
+  messagesDiv.innerHTML = '';
+  // Emit event to server to clear chat messages
+  socket.emit('clear_chat');
+});
+
+socket.on('chat_cleared', () => {
+  // Clear chat UI and message history when server confirms clear for current channel
+  clearMessageHistoryForCurrentChannel();
+  messagesDiv.innerHTML = '';
+});
 
 let myUsername = '';
 let myAvatar = '';
@@ -94,7 +123,18 @@ function renderUserList(users) {
   });
 }
 
+  
 // --- Socket.IO Events ---
+
+socket.on('server_deleted', ({ server }) => {
+  console.log('Server deleted:', server);
+
+  // Remove server from sidebar
+  const serverElement = document.querySelector(`[data-server-name="${server}"]`);
+  if (serverElement) {
+    serverElement.remove();
+  }
+});
 function highlightMentions(text) {
   // Simple placeholder implementation: return text as is
   return text;
@@ -131,10 +171,17 @@ socket.on('channel_list', data => {
   }
 });
 
+let messageIdSet = new Set();
+
 socket.on('joined_channel', data => {
   chatHeader.textContent = `${currentServer} / #${data.channel}`;
   chatForm.style.display = '';
-  messagesDiv.innerHTML = '';
+  // Clear message history and id set before loading new messages
+  clearMessageHistoryForCurrentChannel();
+  messageIdSet.clear();
+  // Render messages for the joined channel from messageHistory
+  const currentMessages = getMessageHistoryForCurrentChannel();
+  renderMessages(currentMessages);
 });
 
 socket.on('typing', data => {
@@ -165,15 +212,29 @@ socket.on('profile_updated', data => {
 });
 
 // --- UI Events ---
+
+let isSendingMessage = false;
+
 chatForm.addEventListener('submit', function(e) {
   console.log('[DEBUG] Form submit event triggered');
   e.preventDefault();
+  if (isSendingMessage) {
+    console.log('[DEBUG] Message send in progress, ignoring duplicate submit');
+    return;
+  }
   const msg = messageInput.value.trim();
   if (msg && currentServer && currentChannel) {
+    isSendingMessage = true;
     // Generate a temporary unique id for the message
     const tempId = 'temp-' + Date.now() + '-' + Math.random().toString(36).substr(2, 9);
-    // Add the message to messageHistory and render immediately
-    messageHistory.push({
+    // Add the message to messageHistory for current channel and render immediately
+    const currentMessages = getMessageHistoryForCurrentChannel();
+    // Remove any existing message with the same tempId to prevent duplicates
+    const existingIndex = currentMessages.findIndex(msg => msg.id === tempId);
+    if (existingIndex !== -1) {
+      currentMessages.splice(existingIndex, 1);
+    }
+    currentMessages.push({
       username: myUsername,
       avatar: myAvatar,
       text: msg,
@@ -182,7 +243,8 @@ chatForm.addEventListener('submit', function(e) {
       timestamp: new Date().toISOString(),
       status: ''
     });
-    renderMessages(messageHistory);
+    setMessageHistoryForCurrentChannel(currentMessages);
+    renderMessages(currentMessages);
     // Emit the message to the server
     socket.emit('message', {
       msg,
@@ -190,8 +252,15 @@ chatForm.addEventListener('submit', function(e) {
       avatar: myAvatar,
       server: currentServer,
       channel: currentChannel
+    }, () => {
+      // Acknowledgement callback from server
+      isSendingMessage = false;
     });
     messageInput.value = '';
+    // Fallback to reset isSendingMessage after 3 seconds in case ack is missed
+    setTimeout(() => {
+      isSendingMessage = false;
+    }, 1000);
   } else {
     alert('Please select a server and channel before sending a message.');
   }
@@ -300,6 +369,14 @@ function editMessage(msgId, div, oldMsg) {
       const newMsg = input.value.trim();
       if (newMsg && newMsg !== oldMsg) {
         socket.emit('edit_message', { id: msgId, text: newMsg });
+        // Update messageHistory immediately to reflect change in UI
+        const currentMessages = getMessageHistoryForCurrentChannel();
+        const index = currentMessages.findIndex(msg => msg.id === msgId);
+        if (index !== -1) {
+          currentMessages[index].text = newMsg;
+          setMessageHistoryForCurrentChannel(currentMessages);
+          renderMessages(currentMessages);
+        }
       }
       input.replaceWith(document.createTextNode(newMsg || oldMsg));
     }
@@ -308,6 +385,14 @@ function editMessage(msgId, div, oldMsg) {
 
 function deleteMessage(msgId) {
   if (confirm('Delete this message?')) {
+    // Immediately remove message from UI for better UX
+    const currentMessages = getMessageHistoryForCurrentChannel();
+    const index = currentMessages.findIndex(msg => msg.id === msgId);
+    if (index !== -1) {
+      currentMessages.splice(index, 1);
+      setMessageHistoryForCurrentChannel(currentMessages);
+      renderMessages(currentMessages);
+    }
     socket.emit('delete_message', { id: msgId });
   }
 }
@@ -336,51 +421,76 @@ function renderMessages(messageList) {
 }
 
 // Store messages for grouping
-let messageHistory = [];
+// Store messages per channel for grouping
+let messageHistory = {};
+
+function getCurrentChannelKey() {
+  return currentServer && currentChannel ? `${currentServer}:${currentChannel}` : null;
+}
+
+function getMessageHistoryForCurrentChannel() {
+  const key = getCurrentChannelKey();
+  if (!key) return [];
+  if (!messageHistory[key]) messageHistory[key] = [];
+  return messageHistory[key];
+}
+
+function setMessageHistoryForCurrentChannel(messages) {
+  const key = getCurrentChannelKey();
+  if (!key) return;
+  messageHistory[key] = messages;
+}
+
+function clearMessageHistoryForCurrentChannel() {
+  const key = getCurrentChannelKey();
+  if (!key) return;
+  messageHistory[key] = [];
+}
 
 socket.on('message', data => {
   console.log('[DEBUG] Received message:', data);
   const self = data.username === myUsername && data.avatar === myAvatar;
 
-  // Replace the temp message if tempId exists
-  if (self && data.tempId) {
-    const index = messageHistory.findIndex(m => m.id === data.tempId);
-    if (index !== -1) {
-      messageHistory[index] = {
-        username: data.username,
-        avatar: data.avatar,
-        text: data.msg,
-        self,
-        id: data.id,
-        timestamp: data.timestamp,
-        status: data.status || ''
-      };
-      renderMessages(messageHistory);
-      return;
-    }
+  const currentMessages = getMessageHistoryForCurrentChannel();
+
+  // Remove any message with the same id or tempId to prevent duplicates
+  const existingIndex = currentMessages.findIndex(msg => msg.id === data.id || (self && msg.id === data.tempId));
+  if (existingIndex !== -1) {
+    currentMessages.splice(existingIndex, 1);
   }
 
-  // Add message only if not already present
-  if (!messageHistory.some(msg => msg.id === data.id)) {
-    messageHistory.push({
-      username: data.username,
-      avatar: data.avatar,
-      text: data.msg,
-      self,
-      id: data.id,
-      timestamp: data.timestamp,
-      status: data.status || ''
-    });
-    renderMessages(messageHistory);
-  } else {
-    console.log('[DEBUG] Duplicate message ignored:', data);
-  }
+  // Add message
+  currentMessages.push({
+    username: data.username,
+    avatar: data.avatar,
+    text: data.msg,
+    self,
+    id: data.id,
+    timestamp: data.timestamp,
+    status: data.status || ''
+  });
+  setMessageHistoryForCurrentChannel(currentMessages);
+  renderMessages(currentMessages);
 });
 
 socket.on('message_update', data => {
-  // Reload channel to update message grouping
-  if (currentServer && currentChannel) {
-    socket.emit('join_channel', { server: currentServer, channel: currentChannel });
+  // Update or remove the specific message in messageHistory and re-render messages
+  const currentMessages = getMessageHistoryForCurrentChannel();
+  const index = currentMessages.findIndex(msg => msg.id === data.id);
+  if (index !== -1) {
+    if (data.msg === undefined || data.msg === null) {
+      // Message deleted, remove from messageHistory
+      currentMessages.splice(index, 1);
+    } else {
+      // Update message properties
+      currentMessages[index].text = data.msg || currentMessages[index].text;
+      currentMessages[index].timestamp = data.timestamp || currentMessages[index].timestamp;
+      currentMessages[index].username = data.username || currentMessages[index].username;
+      currentMessages[index].avatar = data.avatar || currentMessages[index].avatar;
+      currentMessages[index].reactions = data.reactions || currentMessages[index].reactions || {};
+    }
+    setMessageHistoryForCurrentChannel(currentMessages);
+    renderMessages(currentMessages);
   }
 });
 
@@ -524,15 +634,23 @@ function createMessageDiv(username, avatar, msg, self = false, msgId = null, tim
 function renderServers(servers) {
   serverSidebar.querySelectorAll('.server:not(.add-server)').forEach(e => e.remove());
 
+  // Remove existing context menu if any
+  const existingMenu = document.getElementById('server-context-menu');
+  if (existingMenu) {
+    existingMenu.remove();
+  }
+
   servers.forEach(server => {
     const div = document.createElement('div');
     div.className = 'server' + (server === currentServer ? ' selected' : '');
+    div.setAttribute('data-server-name', server);  // Add this attribute for deletion selector
 
     // Use the first letter of the server name in uppercase as the avatar
     const avatar = server.charAt(0).toUpperCase();
 
     // Only show the avatar (first letter) inside the circle icon
     div.innerHTML = `<span class='avatar'>${avatar}</span>`;
+
     div.title = server;
 
     div.onclick = () => {
@@ -549,6 +667,57 @@ function renderServers(servers) {
         userListDiv.innerHTML = '';
       }
     };
+
+    // Add context menu event for right click
+    div.addEventListener('contextmenu', (e) => {
+      e.preventDefault();
+      // Remove any existing context menu
+      const oldMenu = document.getElementById('server-context-menu');
+      if (oldMenu) oldMenu.remove();
+
+      // Create context menu div
+      const menu = document.createElement('div');
+      menu.id = 'server-context-menu';
+      menu.style.position = 'fixed';
+      menu.style.top = `${e.clientY}px`;
+      menu.style.left = `${e.clientX}px`;
+      menu.style.background = '#2f3136';
+      menu.style.border = '1px solid #23272a';
+      menu.style.borderRadius = '6px';
+      menu.style.padding = '0.5rem 0';
+      menu.style.zIndex = '1000';
+      menu.style.minWidth = '120px';
+      menu.style.color = '#fff';
+      menu.style.fontSize = '0.9rem';
+      menu.style.boxShadow = '0 2px 10px rgba(0,0,0,0.5)';
+
+      // Add Delete option
+      const deleteOption = document.createElement('div');
+      deleteOption.textContent = 'Delete Server';
+      deleteOption.style.padding = '0.5rem 1rem';
+      deleteOption.style.cursor = 'pointer';
+      deleteOption.onmouseenter = () => deleteOption.style.background = '#5865f2';
+      deleteOption.onmouseleave = () => deleteOption.style.background = 'transparent';
+      deleteOption.onclick = () => {
+        if (confirm(`Are you sure you want to delete the server "${server}"?`)) {
+          socket.emit('delete_server', { server });
+          menu.remove();
+        }
+      };
+      menu.appendChild(deleteOption);
+
+      // Append menu to body
+      document.body.appendChild(menu);
+
+      // Remove menu on click elsewhere
+      const removeMenu = (event) => {
+        if (!menu.contains(event.target)) {
+          menu.remove();
+          document.removeEventListener('click', removeMenu);
+        }
+      };
+      document.addEventListener('click', removeMenu);
+    });
 
     serverSidebar.insertBefore(div, addServerBtn);
   });
@@ -616,4 +785,3 @@ function renderPinnedBar() {
     pinnedBar.appendChild(div);
   });
 }
-

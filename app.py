@@ -254,7 +254,36 @@ def handle_edit_message(data):
     if row and row[0] == username and row[1] == avatar:
         c.execute('UPDATE messages SET text=? WHERE id=?', (new_text, msg_id))
         conn.commit()
-        socketio.emit('message_update', {'id': msg_id}, broadcast=True)
+        # Fetch updated message details to emit
+        c.execute('SELECT server_id, channel_id, username, avatar, text, timestamp FROM messages WHERE id=?', (msg_id,))
+        updated_msg = c.fetchone()
+        if updated_msg:
+            server_id, channel_id, username, avatar, text, timestamp = updated_msg
+            # Get server and channel names
+            c.execute('SELECT name FROM servers WHERE id=?', (server_id,))
+            server_row = c.fetchone()
+            server_name = server_row[0] if server_row else ''
+            c.execute('SELECT name FROM channels WHERE id=?', (channel_id,))
+            channel_row = c.fetchone()
+            channel_name = channel_row[0] if channel_row else ''
+            # Get reactions
+            c.execute('SELECT emoji, username, avatar FROM reactions WHERE message_id=?', (msg_id,))
+            rows = c.fetchall()
+            reactions = {}
+            for emoji, uname, av in rows:
+                if emoji not in reactions:
+                    reactions[emoji] = []
+                reactions[emoji].append({'username': uname, 'avatar': av})
+            socketio.emit('message_update', {
+                'id': msg_id,
+                'server': server_name,
+                'channel': channel_name,
+                'username': username,
+                'avatar': avatar,
+                'msg': text,
+                'timestamp': timestamp,
+                'reactions': reactions
+            }, broadcast=True)
     conn.close()
 
 @socketio.on('delete_message')
@@ -271,13 +300,17 @@ def handle_delete_message(data):
     if row and row[0] == username and row[1] == avatar:
         c.execute('DELETE FROM messages WHERE id=?', (msg_id,))
         conn.commit()
-        socketio.emit('message_update', {'id': msg_id}, broadcast=True)
+        # Emit message_update with msg set to None to indicate deletion
+        socketio.emit('message_update', {'id': msg_id, 'msg': None}, broadcast=True)
     conn.close()
 
 # Update message sending to include id and timestamp
 @socketio.on('message')
 def handle_message(data):
     temp_id = data.get('tempId')  # Receive tempId from client
+    ack = None
+    if len(request.args) > 0:
+        ack = request.args[0]
 
     sid = request.sid
     server = user_sessions[sid]['server']
@@ -288,6 +321,7 @@ def handle_message(data):
     status = user_sessions[sid].get('status', '')
     print(f"[DEBUG] message event: sid={sid}, server={server}, channel={channel}, msg={msg}", flush=True)
     if server and channel:
+        print(f"[DEBUG] Saving message to DB: {msg}", flush=True)
         # Save message to DB
         server_id = servers[server]['id']
         conn = sqlite3.connect('chat.db')
@@ -310,6 +344,7 @@ def handle_message(data):
                     reactions[emoji] = []
                 reactions[emoji].append({'username': uname, 'avatar': av})
             conn.commit()
+            print(f"[DEBUG] Emitting message event for message id {msg_id}", flush=True)
             socketio.emit('message', {
                 'msg': msg,
                 'username': username,
@@ -321,6 +356,8 @@ def handle_message(data):
                 'tempId': temp_id  # Include it back
             }, room=f'{server}:{channel}')
         conn.close()
+    if ack:
+        ack()
 
 @socketio.on('typing')
 def handle_typing(data):
@@ -443,7 +480,7 @@ def handle_disconnect():
     user = user_sessions.get(sid)
     if user:
         server = user['server']
-        if server and sid in servers[server]['users']:
+        if server and server in servers and sid in servers[server]['users']:
             servers[server]['users'].remove(sid)
             update_user_list(server)
         del user_sessions[sid]
@@ -477,6 +514,61 @@ def update_user_list(server):
 @socketio.on('get_server_list')
 def handle_get_server_list():
     emit('server_list', {'servers': list(servers.keys())}, broadcast=True)
+
+@socketio.on('delete_server')
+def handle_delete_server(data):
+    server_name = data.get('server')
+    print(f"Deleting server: {server_name}")  # Debug
+
+    if server_name in servers:
+        # Remove from in-memory servers dictionary
+        servers.pop(server_name)
+
+        # Remove from database
+        conn = sqlite3.connect('chat.db')
+        c = conn.cursor()
+        # Get server id
+        c.execute('SELECT id FROM servers WHERE name=?', (server_name,))
+        row = c.fetchone()
+        if row:
+            server_id = row[0]
+            # Delete channels for this server
+            c.execute('DELETE FROM channels WHERE server_id=?', (server_id,))
+            # Delete messages for this server
+            c.execute('DELETE FROM messages WHERE server_id=?', (server_id,))
+            # Delete pinned messages for this server
+            c.execute('DELETE FROM pinned_messages WHERE server_id=?', (server_id,))
+            # Delete the server itself
+            c.execute('DELETE FROM servers WHERE id=?', (server_id,))
+            conn.commit()
+        conn.close()
+
+        # Emit update to all clients
+        emit('server_deleted', {'server': server_name}, broadcast=True)
+
+@socketio.on('clear_chat')
+def handle_clear_chat():
+    sid = request.sid
+    user = user_sessions.get(sid)
+    if not user:
+        return
+    server = user.get('server')
+    channel = user.get('channel')
+    if not server or not channel:
+        return
+    server_id = servers[server]['id']
+    conn = sqlite3.connect('chat.db')
+    c = conn.cursor()
+    c.execute('SELECT id FROM channels WHERE name=? AND server_id=?', (channel, server_id))
+    row = c.fetchone()
+    if row:
+        channel_id = row[0]
+        # Delete all messages for this server and channel
+        c.execute('DELETE FROM messages WHERE server_id=? AND channel_id=?', (server_id, channel_id))
+        conn.commit()
+        # Emit event to clear chat for all clients in the room
+        socketio.emit('chat_cleared', room=f'{server}:{channel}')
+    conn.close()
 
 if __name__ == '__main__':
     socketio.run(app, debug=True)
