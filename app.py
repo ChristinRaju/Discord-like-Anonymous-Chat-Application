@@ -8,6 +8,13 @@ import sqlite3
 import eventlet
 eventlet.monkey_patch()
 
+from flask import Flask, render_template, request, session
+from flask_socketio import SocketIO, join_room, leave_room, emit
+import os
+import random
+import string
+import sqlite3
+
 app = Flask(__name__)
 app.secret_key = os.urandom(24)
 socketio = SocketIO(app, async_mode='eventlet')
@@ -103,23 +110,69 @@ def load_servers_channels():
 init_db()
 load_servers_channels()
 
+from flask import redirect, url_for, session as flask_session
+
 @app.route('/')
 def index():
+    if not flask_session.get('user_id'):
+        return redirect(url_for('login'))
     return render_template('index.html', servers=servers)
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    from flask import request
+    import sqlite3
+    if flask_session.get('user_id'):
+        return redirect(url_for('index'))
+    if request.method == 'POST':
+        nickname = request.form.get('nickname')
+        avatar = request.form.get('avatar')
+        status = request.form.get('status', '')
+        if not nickname or not avatar:
+            return render_template('login.html', error="Nickname and Avatar are required.")
+        # Save user info in DB and session
+        conn = sqlite3.connect('chat.db')
+        c = conn.cursor()
+        # Generate a session id for user
+        import uuid
+        user_session_id = str(uuid.uuid4())
+        # Insert or update user in users table
+        c.execute('SELECT id FROM users WHERE username=? AND avatar=?', (nickname, avatar))
+        row = c.fetchone()
+        if row:
+            user_id = row[0]
+            c.execute('UPDATE users SET status=?, session_id=?, online=1, last_seen=datetime("now") WHERE id=?', (status, user_session_id, user_id))
+        else:
+            c.execute('INSERT INTO users (username, avatar, status, session_id, online, last_seen) VALUES (?, ?, ?, ?, 1, datetime("now"))', (nickname, avatar, status, user_session_id))
+            user_id = c.lastrowid
+        conn.commit()
+        conn.close()
+        flask_session['user_id'] = user_id
+        flask_session['user_session_id'] = user_session_id
+        flask_session['username'] = nickname
+        flask_session['avatar'] = avatar
+        flask_session['status'] = status
+        return redirect(url_for('index'))
+    return render_template('login.html')
 
 # Socket.IO events
 # On connect, set online=1 and update last_seen
 @socketio.on('connect')
 def handle_connect(auth):
+    from flask import session as flask_session
     print(f"[DEBUG] New client connected: {request.sid}")
     sid = request.sid
     conn = sqlite3.connect('chat.db')
     c = conn.cursor()
-    c.execute('SELECT username, avatar, status FROM users WHERE session_id=?', (sid,))
+    user_session_id = flask_session.get('user_session_id')
+    if user_session_id:
+        c.execute('SELECT username, avatar, status FROM users WHERE session_id=?', (user_session_id,))
+    else:
+        c.execute('SELECT username, avatar, status FROM users WHERE session_id=?', (sid,))
     row = c.fetchone()
     if row:
         username, avatar, status = row
-        c.execute('UPDATE users SET online=1, last_seen=datetime("now") WHERE session_id=?', (sid,))
+        c.execute('UPDATE users SET online=1, last_seen=datetime("now") WHERE session_id=?', (user_session_id if user_session_id else sid,))
     else:
         username = random_username()
         avatar = random_avatar()
@@ -283,7 +336,7 @@ def handle_edit_message(data):
                 'msg': text,
                 'timestamp': timestamp,
                 'reactions': reactions
-            }, broadcast=True)
+            }, broadcast=True, namespace='/')
     conn.close()
 
 @socketio.on('delete_message')
@@ -301,16 +354,13 @@ def handle_delete_message(data):
         c.execute('DELETE FROM messages WHERE id=?', (msg_id,))
         conn.commit()
         # Emit message_update with msg set to None to indicate deletion
-        socketio.emit('message_update', {'id': msg_id, 'msg': None}, broadcast=True)
+        socketio.emit('message_update', {'id': msg_id, 'msg': None}, broadcast=True, namespace='/')
     conn.close()
 
 # Update message sending to include id and timestamp
 @socketio.on('message')
-def handle_message(data):
+def handle_message(data, ack=None):
     temp_id = data.get('tempId')  # Receive tempId from client
-    ack = None
-    if len(request.args) > 0:
-        ack = request.args[0]
 
     sid = request.sid
     server = user_sessions[sid]['server']
@@ -408,7 +458,7 @@ def broadcast_reactions(msg_id):
         if emoji not in reactions:
             reactions[emoji] = []
         reactions[emoji].append({'username': username, 'avatar': avatar})
-    socketio.emit('reactions_update', {'message_id': msg_id, 'reactions': reactions}, broadcast=True)
+    socketio.emit('reactions_update', {'message_id': msg_id, 'reactions': reactions}, broadcast=True, namespace='/')
 
 @socketio.on('pin_message')
 def handle_pin_message(data):
