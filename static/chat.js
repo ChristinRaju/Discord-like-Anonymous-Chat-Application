@@ -2,6 +2,7 @@ console.log("✅ chat.js loaded");
 
 let messageEventCount = 0;
 let socketConnectCount = 0;
+let pinnedMessages = [];
 
 const socket = io();
 console.log('[DEBUG] Socket connection established');
@@ -29,7 +30,6 @@ const profileAvatar = document.getElementById('profile-avatar');
 const profileStatus = document.getElementById('profile-status');
 const profileSave = document.getElementById('profile-save');
 const profileCancel = document.getElementById('profile-cancel');
-const themeToggle = document.getElementById('theme-toggle');
 const pinnedBar = document.getElementById('pinned-bar');
 const addServerModal = document.getElementById('add-server-modal');
 const addServerName = document.getElementById('add-server-name');
@@ -251,7 +251,8 @@ chatForm.addEventListener('submit', function(e) {
       username: myUsername,
       avatar: myAvatar,
       server: currentServer,
-      channel: currentChannel
+      channel: currentChannel,
+      tempId: tempId
     }, () => {
       // Acknowledgement callback from server
       isSendingMessage = false;
@@ -576,19 +577,24 @@ function createMessageDiv(username, avatar, msg, self = false, msgId = null, tim
   }
   // Pin/unpin button
   if (msgId) {
-    const isPinned = pinnedMessages.some(m => m.id === msgId);
-    const pinBtn = document.createElement('button');
-    pinBtn.className = 'pin-btn' + (isPinned ? ' pinned' : '');
-    pinBtn.title = isPinned ? 'Unpin message' : 'Pin message';
-    pinBtn.innerHTML = '📌';
-    pinBtn.onclick = () => {
-      if (isPinned) {
-        socket.emit('unpin_message', { message_id: msgId });
-      } else {
-        socket.emit('pin_message', { message_id: msgId });
-      }
-    };
-    div.appendChild(pinBtn);
+    // Disable pin button for temporary message IDs starting with "temp-"
+    if (typeof msgId === 'string' && msgId.startsWith('temp-')) {
+      // Do not show pin button for temporary messages
+    } else {
+      const isPinned = pinnedMessages.some(m => m.id === msgId);
+      const pinBtn = document.createElement('button');
+      pinBtn.className = 'pin-btn' + (isPinned ? ' pinned' : '');
+      pinBtn.title = isPinned ? 'Unpin message' : 'Pin message';
+      pinBtn.innerHTML = '📌';
+      pinBtn.onclick = () => {
+        if (isPinned) {
+          socket.emit('unpin_message', { message_id: msgId });
+        } else {
+          socket.emit('pin_message', { message_id: msgId });
+        }
+      };
+      div.appendChild(pinBtn);
+    }
   }
   // Toast notification if this message mentions me (and not my own message)
   if (!self && myUsername && msg.toLowerCase().includes('@' + myUsername.toLowerCase())) {
@@ -733,26 +739,6 @@ function escapeHTML(str) {
   return str.replace(/[&<>'"]/g, tag => ({'&':'&amp;','<':'<','>':'>','\'':'&#39;','"':'"'}[tag]));
 }
 
-function setTheme(theme) {
-  if (theme === 'light') {
-    document.body.classList.add('theme-light');
-    themeToggle.textContent = '☀️';
-  } else {
-    document.body.classList.remove('theme-light');
-    themeToggle.textContent = '🌙';
-  }
-  localStorage.setItem('theme', theme);
-}
-
-themeToggle.onclick = () => {
-  const isLight = document.body.classList.contains('theme-light');
-  setTheme(isLight ? 'dark' : 'light');
-};
-
-// On load, restore theme
-const savedTheme = localStorage.getItem('theme');
-setTheme(savedTheme === 'light' ? 'light' : 'dark'); 
-
 socket.on('pinned_messages', data => {
   // Only update if in the current channel
   if (data.server === currentServer && data.channel === currentChannel) {
@@ -764,6 +750,12 @@ socket.on('pinned_messages', data => {
 function renderPinnedBar() {
   pinnedBar.innerHTML = '';
   if (!pinnedMessages.length) return;
+  const header = document.createElement('div');
+  header.style.fontWeight = 'bold';
+  header.style.marginBottom = '0.5em';
+  header.style.color = '#fff';
+  header.textContent = 'Pinned Messages';
+  pinnedBar.appendChild(header);
   pinnedMessages.forEach(msg => {
     const div = document.createElement('div');
     div.className = 'pinned-msg';
