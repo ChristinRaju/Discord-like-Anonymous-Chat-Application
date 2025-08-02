@@ -1,13 +1,3 @@
-from flask import Flask, render_template, request, session
-from flask_socketio import SocketIO, join_room, leave_room, emit
-import os
-import random
-import string
-import sqlite3
-
-# Add ngrok import
-from pyngrok import ngrok
-
 import eventlet
 eventlet.monkey_patch()
 
@@ -633,22 +623,10 @@ def handle_clear_chat():
     conn.close()
 
 if __name__ == '__main__':
-    # Start ngrok tunnel
-    try:
-        # Kill any existing ngrok processes
-        ngrok.kill()
-        
-        # Create HTTP tunnel
-        public_url = ngrok.connect(5000)
-        print(f"\n🌐 Your chat app is now accessible from anywhere!")
-        print(f"📱 Public URL: {public_url}")
-        print(f"🔗 Share this link with your friends!")
-        print(f"📊 ngrok dashboard: http://localhost:4040")
-        print(f"\n🚀 Starting Flask server...\n")
-        
-    except Exception as e:
-        print(f"⚠️  ngrok error: {e}")
-        print("📱 Starting without public URL (only local network access)")
-    
-    # Start Flask server
-    socketio.run(app, debug=True, host='0.0.0.0', port=5000)
+    print("🚀 Starting Real-time Chat Application...")
+    print("=" * 50)
+    print("📱 Local access: http://localhost:5000")
+    print("🌐 Network access: http://192.168.71.243:5000")
+    print("💡 Share the network URL with friends on the same WiFi")
+    print("=" * 50)
+    socketio.run(app, debug=True, host='0.0.0.0', port=5000) 
