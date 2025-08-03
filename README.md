@@ -127,10 +127,14 @@ If you encounter issues:
 ## 🎉 Current Status
 
 ✅ **Server is running** on port 5000  
-✅ **Local access**: http://localhost:5000  
-✅ **Network access**: http://192.168.71.243:5000  
+✅ **Local access**: http://localhost:5000   
 ✅ **Public access**: Available via ngrok  
 
 ## 🎉 Enjoy Your Chat!
 
 Your friends can now join your chat from anywhere in the world! The app includes all modern chat features like typing indicators, reactions, and real-time messaging.
+
+<p align="center">
+  <img src="https://komarev.com/ghpvc/?username=LuziaAnaJS&style=flat-square&color=F720D4" alt="Profile views" />
+</p>
+
