@@ -84,6 +84,16 @@ def init_db():
         UNIQUE(message_id, channel_id),
         FOREIGN KEY(message_id) REFERENCES messages(id)
     )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS user_cleared_messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_session_id TEXT NOT NULL,
+        server_id INTEGER NOT NULL,
+        channel_id INTEGER NOT NULL,
+        cleared_before_timestamp DATETIME NOT NULL,
+        UNIQUE(user_session_id, server_id, channel_id),
+        FOREIGN KEY(server_id) REFERENCES servers(id),
+        FOREIGN KEY(channel_id) REFERENCES channels(id)
+    )''')
     conn.commit()
     conn.close()
 
@@ -264,7 +274,26 @@ def handle_join_channel(data):
         row = c.fetchone()
         if row:
             channel_id = row[0]
-            c.execute('SELECT id, username, avatar, text, timestamp FROM messages WHERE server_id=? AND channel_id=? ORDER BY id DESC LIMIT 50', (server_id, channel_id))
+
+            # Get user session ID for cleared message filtering
+            user_session_id = flask_session.get('user_session_id', sid)
+            
+            # Check if user has cleared messages for this channel
+            c.execute('SELECT cleared_before_timestamp FROM user_cleared_messages WHERE user_session_id=? AND server_id=? AND channel_id=?', 
+                     (user_session_id, server_id, channel_id))
+            cleared_row = c.fetchone()
+            cleared_before_timestamp = cleared_row[0] if cleared_row else None
+
+            if cleared_before_timestamp:
+                # Only load messages after the cleared timestamp
+                c.execute('SELECT id, username, avatar, text, timestamp FROM messages WHERE server_id=? AND channel_id=? AND timestamp > ? ORDER BY id DESC LIMIT 50', 
+                         (server_id, channel_id, cleared_before_timestamp))
+            else:
+                # Load all messages (user hasn't cleared any)
+                c.execute('SELECT id, username, avatar, text, timestamp FROM messages WHERE server_id=? AND channel_id=? ORDER BY id DESC LIMIT 50', 
+                         (server_id, channel_id))
+
+            #c.execute('SELECT id, username, avatar, text, timestamp FROM messages WHERE server_id=? AND channel_id=? ORDER BY id DESC LIMIT 50', (server_id, channel_id))
             messages = c.fetchall()[::-1]  # reverse to chronological order
             for msg_id, username, avatar, text, timestamp in messages:
                 # Lookup status for each user
@@ -460,7 +489,7 @@ def broadcast_reactions(msg_id):
         if emoji not in reactions:
             reactions[emoji] = []
         reactions[emoji].append({'username': username, 'avatar': avatar})
-    socketio.emit('reactions_update', {'message_id': msg_id, 'reactions': reactions}, broadcast=True, namespace='/')
+    socketio.emit('reactions_update', {'message_id': msg_id, 'reactions': reactions}, namespace='/')
 
 @socketio.on('pin_message')
 def handle_pin_message(data):
@@ -600,26 +629,32 @@ def handle_delete_server(data):
 
 @socketio.on('clear_chat')
 def handle_clear_chat():
+    from flask import session as flask_session
     sid = request.sid
-    user = user_sessions.get(sid)
-    if not user:
+    server = user_sessions[sid]['server']
+    channel = user_sessions[sid]['channel']
+    if not (server and channel):
         return
-    server = user.get('server')
-    channel = user.get('channel')
-    if not server or not channel:
-        return
+        
     server_id = servers[server]['id']
+    user_session_id = flask_session.get('user_session_id', sid)
+    
     conn = sqlite3.connect('chat.db')
     c = conn.cursor()
     c.execute('SELECT id FROM channels WHERE name=? AND server_id=?', (channel, server_id))
     row = c.fetchone()
     if row:
         channel_id = row[0]
-        # Delete all messages for this server and channel
-        c.execute('DELETE FROM messages WHERE server_id=? AND channel_id=?', (server_id, channel_id))
+        # Record the current timestamp as the clear point for this user
+        c.execute('''INSERT OR REPLACE INTO user_cleared_messages 
+                     (user_session_id, server_id, channel_id, cleared_before_timestamp) 
+                     VALUES (?, ?, ?, datetime("now"))''', 
+                 (user_session_id, server_id, channel_id))
         conn.commit()
-        # Emit event to clear chat for all clients in the room
-        socketio.emit('chat_cleared', room=f'{server}:{channel}')
+        print(f"[DEBUG] User {user_session_id} cleared chat for channel {channel} in server {server}", flush=True)
+        
+        # Send confirmation back to the client only
+        emit('chat_cleared')
     conn.close()
 
 if __name__ == '__main__':
