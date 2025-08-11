@@ -76,6 +76,80 @@ let myStatus = '';
 let messageBuffer = [];
 let sessionReady = false;
 
+// Reply state management
+let currentReply = null; // { msgId, username, avatar, text }
+
+function startReply(msgId, username, avatar, text) {
+  currentReply = { msgId, username, avatar, text };
+  showReplyPreview();
+  messageInput.focus();
+}
+
+function cancelReply() {
+  currentReply = null;
+  hideReplyPreview();
+}
+
+function showReplyPreview() {
+  if (!currentReply) return;
+  
+  // Remove existing reply preview
+  const existingPreview = document.getElementById('reply-preview');
+  if (existingPreview) {
+    existingPreview.remove();
+  }
+  
+  // Create reply preview element
+  const preview = document.createElement('div');
+  preview.id = 'reply-preview';
+  preview.className = 'reply-preview';
+  preview.style.cssText = `
+    background: rgba(88, 101, 242, 0.1);
+    border-left: 3px solid #5865f2;
+    padding: 0.5rem;
+    margin: 0.5rem 0;
+    border-radius: 3px;
+    font-size: 0.9em;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  `;
+  
+  const replyText = currentReply.text.length > 50 
+    ? currentReply.text.substring(0, 50) + '...'
+    : currentReply.text;
+  
+  const content = document.createElement('div');
+  content.innerHTML = `↳ Replying to <b>${currentReply.username}</b>: "${replyText}"`;
+  
+  const cancelBtn = document.createElement('button');
+  cancelBtn.innerHTML = '✕';
+  cancelBtn.style.cssText = `
+    background: none;
+    border: none;
+    color: #aaa;
+    cursor: pointer;
+    font-size: 1.2em;
+    padding: 0;
+    margin-left: 0.5rem;
+  `;
+  cancelBtn.onclick = cancelReply;
+  cancelBtn.title = 'Cancel reply';
+  
+  preview.appendChild(content);
+  preview.appendChild(cancelBtn);
+  
+  // Insert before chat form
+  chatForm.parentNode.insertBefore(preview, chatForm);
+}
+
+function hideReplyPreview() {
+  const preview = document.getElementById('reply-preview');
+  if (preview) {
+    preview.remove();
+  }
+}
+
 function renderChannels(channels) {
   channelList.innerHTML = '';
   channels.forEach(channel => {
@@ -178,6 +252,24 @@ socket.on('session', data => {
         status: data.status || '',
         reactions: data.reactions || {}
       });
+
+            // Add reply data if present from server
+      if (data.replyTo && data.replyTo.id) {
+        messageObj.replyTo = {
+          id: data.replyTo.id,
+          text: data.replyTo.text,
+          username: data.replyTo.username,
+          avatar: data.replyTo.avatar
+        };
+      }
+      
+      if (data.threadId) {
+        messageObj.threadId = data.threadId;
+      }
+      
+      currentMessages.push(messageObj);
+
+
     });
     setMessageHistoryForCurrentChannel(currentMessages);
     renderMessages(currentMessages);
@@ -296,61 +388,85 @@ socket.on('profile_updated', data => {
 });
 
 // --- UI Events ---
-
 let isSendingMessage = false;
 
-chatForm.addEventListener('submit', function(e) {
+chatForm.addEventListener('submit', function (e) {
   console.log('[DEBUG] Form submit event triggered');
   e.preventDefault();
+
   if (isSendingMessage) {
     console.log('[DEBUG] Message send in progress, ignoring duplicate submit');
     return;
   }
+
   const msg = messageInput.value.trim();
-  if (msg && currentServer && currentChannel) {
-    isSendingMessage = true;
-    // Generate a temporary unique id for the message
-    const tempId = 'temp-' + Date.now() + '-' + Math.random().toString(36).substr(2, 9);
-    // Add the message to messageHistory for current channel and render immediately
-    const currentMessages = getMessageHistoryForCurrentChannel();
-    // Remove any existing message with the same tempId to prevent duplicates
-    const existingIndex = currentMessages.findIndex(msg => msg.id === tempId);
-    if (existingIndex !== -1) {
-      currentMessages.splice(existingIndex, 1);
-    }
-    currentMessages.push({
-      username: myUsername,
-      avatar: myAvatar,
-      text: msg,
-      self: true,
-      id: tempId,
-      timestamp: new Date().toISOString(),
-      status: '',
-      reactions: {}
-    });
-    setMessageHistoryForCurrentChannel(currentMessages);
-    renderMessages(currentMessages);
-    // Emit the message to the server
-    socket.emit('message', {
-      msg,
-      username: myUsername,
-      avatar: myAvatar,
-      server: currentServer,
-      channel: currentChannel,
-      tempId: tempId
-    }, () => {
-      // Acknowledgement callback from server
-      isSendingMessage = false;
-    });
-    messageInput.value = '';
-    // Fallback to reset isSendingMessage after 3 seconds in case ack is missed
-    setTimeout(() => {
-      isSendingMessage = false;
-    }, 1000);
-  } else {
+  if (!msg || !currentServer || !currentChannel) {
     alert('Please select a server and channel before sending a message.');
+    return;
   }
+
+  isSendingMessage = true;
+
+  // Generate a temporary unique id for the message
+  const tempId = `temp-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+
+  // Add to local history immediately
+  const currentMessages = getMessageHistoryForCurrentChannel();
+
+  // Remove any existing message with same tempId (shouldn’t normally happen)
+  const existingIndex = currentMessages.findIndex(m => m.id === tempId);
+  if (existingIndex !== -1) {
+    currentMessages.splice(existingIndex, 1);
+  }
+
+  currentMessages.push({
+    username: myUsername,
+    avatar: myAvatar,
+    text: msg,
+    self: true,
+    id: tempId,
+    timestamp: new Date().toISOString(),
+    status: '',
+    reactions: {}
+  });
+
+  setMessageHistoryForCurrentChannel(currentMessages);
+  renderMessages(currentMessages);
+
+  // Build message object to send to server
+  const messageData = {
+    msg,
+    username: myUsername,
+    avatar: myAvatar,
+    server: currentServer,
+    channel: currentChannel,
+    tempId: tempId
+  };
+
+  if (currentReply) {
+    messageData.reply_to = currentReply.msgId;
+  }
+
+  // Safety timeout in case server never acknowledges
+  const sendTimeout = setTimeout(() => {
+    console.warn('[DEBUG] Message ack not received, resetting state');
+    isSendingMessage = false;
+  }, 3000);
+
+  // Send to server
+  socket.emit('message', messageData, () => {
+    clearTimeout(sendTimeout); // prevent fallback reset
+    isSendingMessage = false;
+  });
+
+  // Clear input and reply
+  messageInput.value = '';
+  cancelReply();
 });
+
+
+
+
 
 messageInput.addEventListener('input', function() {
   if (currentServer && currentChannel) {
@@ -502,7 +618,54 @@ function deleteMessage(msgId) {
 }
 
 function copyText(msg) {
-  navigator.clipboard.writeText(msg);
+  // Check if the Clipboard API is available and we have permissions
+  if (navigator.clipboard && window.isSecureContext) {
+    // Use modern Clipboard API
+    navigator.clipboard.writeText(msg).then(
+      () => {
+        console.log('[DEBUG] Message copied to clipboard successfully');
+        showToast('Message copied to clipboard!');
+      },
+      (err) => {
+        console.error('[ERROR] Failed to copy message:', err);
+        fallbackCopyText(msg);
+      }
+    );
+  } else {
+    // Fallback for older browsers or insecure contexts
+    fallbackCopyText(msg);
+  }
+}
+
+// Fallback copy function using the older method
+function fallbackCopyText(msg) {
+  try {
+    // Create a temporary textarea element
+    const textArea = document.createElement('textarea');
+    textArea.value = msg;
+    textArea.style.position = 'fixed';
+    textArea.style.left = '-9999px';
+    textArea.style.top = '-9999px';
+    textArea.style.opacity = '0';
+    document.body.appendChild(textArea);
+    textArea.focus();
+    textArea.select();
+    
+    // Try to copy using the older execCommand method
+    const successful = document.execCommand('copy');
+    document.body.removeChild(textArea);
+    
+    if (successful) {
+      console.log('[DEBUG] Message copied to clipboard using fallback method');
+      showToast('Message copied to clipboard!');
+    } else {
+      console.error('[ERROR] Fallback copy method failed');
+      showToast('Failed to copy message. Please try selecting and copying manually.');
+    }
+  } catch (err) {
+    console.error('[ERROR] Copy operation failed:', err);
+    showToast('Copy not supported. Please select and copy the text manually.');
+  }
 }
 
 // Message grouping
@@ -517,7 +680,7 @@ function renderMessages(messageList) {
       groupDiv.className = 'chat-message-group fade-in';
       messagesDiv.appendChild(groupDiv);
     }
-    const messageDiv = createMessageDiv(msg.username, msg.avatar, msg.text, msg.self, msg.id, msg.timestamp, msg.status, msg.reactions);
+    const messageDiv = createMessageDiv(msg.username, msg.avatar, msg.text, msg.self, msg.id, msg.timestamp, msg.status, msg.reactions, msg.replyTo, msg.threadId);
     if (groupDiv) groupDiv.appendChild(messageDiv);
     lastUser = msg;
   });
@@ -579,6 +742,22 @@ socket.on('message', data => {
     status: data.status || '',
     reactions: data.reactions || {}
   });
+
+    // Add reply data if present
+  if (data.reply_to_id && data.reply_to_text && data.reply_to_username && data.reply_to_avatar) {
+    messageObj.replyTo = {
+      id: data.reply_to_id,
+      text: data.reply_to_text,
+      username: data.reply_to_username,
+      avatar: data.reply_to_avatar
+    };
+  }
+  
+  if (data.thread_id) {
+    messageObj.threadId = data.thread_id;
+  }
+
+  currentMessages.push(messageObj);
   setMessageHistoryForCurrentChannel(currentMessages);
   renderMessages(currentMessages);
 });
@@ -610,14 +789,15 @@ socket.on('reactions_update', data => {
   
   // Update the message in messageHistory with the new reactions
   const currentMessages = getMessageHistoryForCurrentChannel();
-  const messageIndex = currentMessages.findIndex(msg => msg.id == data.message_id);
+  const messageIndex = currentMessages.findIndex(msg => String(msg.id) === String(data.message_id));
   if (messageIndex !== -1) {
     currentMessages[messageIndex].reactions = data.reactions;
     setMessageHistoryForCurrentChannel(currentMessages);
+    // Re-render messages to update reactions
+    renderMessages(currentMessages);
+  } else {
+    console.log('Message not found in current channel for reaction update:', data.message_id);
   }
-  
-  // Re-render messages to update reactions
-  renderMessages(currentMessages);
 });
 
 // Default emoji options for reactions
@@ -649,7 +829,7 @@ function createReactionsBar(msgId, reactions) {
         socket.emit('remove_reaction', { message_id: msgId, emoji });
         // Immediately remove from UI
         const currentMessages = getMessageHistoryForCurrentChannel();
-        const messageIndex = currentMessages.findIndex(msg => msg.id == msgId);
+        const messageIndex = currentMessages.findIndex(msg => String(msg.id) === String(msgId));
         if (messageIndex !== -1 && currentMessages[messageIndex].reactions && currentMessages[messageIndex].reactions[emoji]) {
           currentMessages[messageIndex].reactions[emoji] = currentMessages[messageIndex].reactions[emoji].filter(
             u => !(u.username === myUsername && u.avatar === myAvatar)
@@ -665,7 +845,7 @@ function createReactionsBar(msgId, reactions) {
         socket.emit('add_reaction', { message_id: msgId, emoji });
         // Immediately add to UI
         const currentMessages = getMessageHistoryForCurrentChannel();
-        const messageIndex = currentMessages.findIndex(msg => msg.id == msgId);
+        const messageIndex = currentMessages.findIndex(msg => String(msg.id) === String(msgId));
         if (messageIndex !== -1) {
           if (!currentMessages[messageIndex].reactions) {
             currentMessages[messageIndex].reactions = {};
@@ -714,7 +894,7 @@ function showReactionPicker(msgId, actionsElement) {
       
       // Immediately update the UI to show the reaction
       const currentMessages = getMessageHistoryForCurrentChannel();
-      const messageIndex = currentMessages.findIndex(msg => msg.id == msgId);
+      const messageIndex = currentMessages.findIndex(msg => String(msg.id) === String(msgId));
       if (messageIndex !== -1) {
         // Initialize reactions if not exists
         if (!currentMessages[messageIndex].reactions) {
@@ -760,12 +940,143 @@ function showReactionPicker(msgId, actionsElement) {
 }
 
 // Update createMessageDiv to render reactions bar
-function createMessageDiv(username, avatar, msg, self = false, msgId = null, timestamp = null, status = '', reactions = []) {
+function createMessageDiv(username, avatar, msg, self = false, msgId = null, timestamp = null, status = '', reactions = [], replyTo = null, threadId = null) {
   const div = document.createElement('div');
   div.style.display = 'flex';
   div.style.alignItems = 'center';
   div.style.gap = '0.5rem';
   div.className = 'chat-message fade-in';
+
+  // If this is a reply, show the quoted message with reply indicator
+  if (replyTo) {
+    // First, add the "↳ Replying to [username]: [message]" indicator
+    const replyIndicator = document.createElement('div');
+    replyIndicator.className = 'reply-indicator';
+    replyIndicator.style.cssText = `
+      margin-bottom: 0.5em;
+      padding: 0.3em 0.5em;
+      font-size: 0.85em;
+      color: #b9bbbe;
+      font-style: italic;
+      border-left: 3px solid #5865f2;
+      background: rgba(88, 101, 242, 0.1);
+      border-radius: 3px;
+    `;
+    
+    const truncatedReplyText = replyTo.text.length > 40 
+      ? replyTo.text.substring(0, 40) + '...'
+      : replyTo.text;
+    
+    replyIndicator.innerHTML = `↳ Replying to <b style="color: #ffffff;">${replyTo.username}</b>: "${truncatedReplyText}"`;
+    
+    // Then add the Discord-style visual reply container
+    const replyContainer = document.createElement('div');
+    replyContainer.className = 'reply-container';
+    replyContainer.style.cssText = `
+      display: flex;
+      align-items: center;
+      margin-bottom: 0.25em;
+      padding: 0.1em 0.5em;
+      padding-left: 3.5em;
+      font-size: 0.875em;
+      color: #b9bbbe;
+      cursor: pointer;
+      border-radius: 3px;
+      transition: background 0.15s ease;
+      position: relative;
+    `;
+    
+    // Add hover effect
+    replyContainer.onmouseenter = () => {
+      replyContainer.style.background = 'rgba(79, 84, 92, 0.16)';
+    };
+    replyContainer.onmouseleave = () => {
+      replyContainer.style.background = 'transparent';
+    };
+    
+    // Reply line (like Discord's curved line)
+    const replyLine = document.createElement('div');
+    replyLine.style.cssText = `
+      position: absolute;
+      left: 2.2em;
+      top: -0.5em;
+      width: 2.25em;
+      height: 1.375em;
+      border-left: 2px solid #4f545c;
+      border-top: 2px solid #4f545c;
+      border-top-left-radius: 6px;
+      margin-right: 0.25em;
+    `;
+    
+    // Profile picture (smaller, like Discord)
+    const profilePic = document.createElement('div');
+    profilePic.style.cssText = `
+      position: absolute;
+      left: 0.75em;
+      width: 1em;
+      height: 1em;
+      border-radius: 50%;
+      background: #36393f;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 0.6em;
+      flex-shrink: 0;
+    `;
+    profilePic.textContent = replyTo.avatar;
+    
+    // Username
+    const replyUsername = document.createElement('span');
+    replyUsername.textContent = replyTo.username;
+    replyUsername.style.cssText = `
+      color: #ffffff;
+      font-weight: 500;
+      margin-right: 0.25em;
+      font-size: 0.875em;
+      opacity: 0.64;
+    `;
+    
+    // Message preview
+    const replyPreview = document.createElement('span');
+    const truncatedText = replyTo.text.length > 50 
+      ? replyTo.text.substring(0, 50) + '...'
+      : replyTo.text;
+    replyPreview.textContent = truncatedText;
+    replyPreview.style.cssText = `
+      color: #dcddde;
+      font-weight: 400;
+      opacity: 0.64;
+      word-break: break-word;
+      line-height: 1.125;
+    `;
+    
+    // Assembly
+    replyContainer.appendChild(replyLine);
+    replyContainer.appendChild(profilePic);
+    replyContainer.appendChild(replyUsername);
+    replyContainer.appendChild(replyPreview);
+    
+    // Add click handler to scroll to original message (future enhancement)
+    replyContainer.onclick = (e) => {
+      e.stopPropagation();
+      console.log('Clicked on reply reference, original message ID:', replyTo.id);
+      // TODO: Implement jump to original message functionality
+    };
+    
+    // Add reply elements to the div
+    div.appendChild(replyIndicator);
+    div.appendChild(replyContainer);
+  }
+  
+  // Create the main message content container
+  const messageContent = document.createElement('div');
+  messageContent.style.cssText = `
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    width: 100%;
+  `;
+
   // Status dot
   const { online, last_seen } = getUserStatus(username, avatar);
   const statusDot = document.createElement('span');
@@ -823,18 +1134,22 @@ function createMessageDiv(username, avatar, msg, self = false, msgId = null, tim
         <button class='msg-btn msg-delete' title='Delete'>🗑️</button>
         <button class='msg-btn msg-copy' title='Copy'>📋</button>
         <button class='msg-btn msg-react' title='React'>😊</button>
+        <button class='msg-btn msg-reply' title='Reply'>↩️</button>
       `;
       actions.querySelector('.msg-edit').onclick = () => editMessage(msgId, div, msg);
       actions.querySelector('.msg-delete').onclick = () => deleteMessage(msgId);
       actions.querySelector('.msg-copy').onclick = () => copyText(msg);
       actions.querySelector('.msg-react').onclick = () => showReactionPicker(msgId, actions);
+      actions.querySelector('.msg-reply').onclick = () => startReply(msgId, username, avatar, msg);
     } else {
       actions.innerHTML = `
         <button class='msg-btn msg-copy' title='Copy'>📋</button>
         <button class='msg-btn msg-react' title='React'>😊</button>
+        <button class='msg-btn msg-reply' title='Reply'>↩️</button>
       `;
       actions.querySelector('.msg-copy').onclick = () => copyText(msg);
       actions.querySelector('.msg-react').onclick = () => showReactionPicker(msgId, actions);
+      actions.querySelector('.msg-reply').onclick = () => startReply(msgId, username, avatar, msg);
     }
     div.appendChild(actions);
   }
