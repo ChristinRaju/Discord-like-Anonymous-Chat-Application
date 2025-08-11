@@ -645,28 +645,16 @@ def handle_clear_chat():
     row = c.fetchone()
     if row:
         channel_id = row[0]
-        
-        # First delete associated reactions for messages in this channel (before deleting messages)
-        c.execute('''DELETE FROM reactions WHERE message_id IN (
-                     SELECT id FROM messages WHERE server_id=? AND channel_id=?
-                     )''', (server_id, channel_id))
-        
-        # Then delete all messages for this channel and server from the database
-        # This ensures messages are completely gone and won't reappear
-        c.execute('DELETE FROM messages WHERE server_id=? AND channel_id=?', (server_id, channel_id))
-        
-        # Delete pinned messages for this channel
-        c.execute('DELETE FROM pinned_messages WHERE server_id=? AND channel_id=?', (server_id, channel_id))
-        
-        # Remove the user's cleared messages record since all messages are now deleted
-        c.execute('DELETE FROM user_cleared_messages WHERE user_session_id=? AND server_id=? AND channel_id=?', 
+        # Record the current timestamp as the clear point for this user
+        c.execute('''INSERT OR REPLACE INTO user_cleared_messages 
+                     (user_session_id, server_id, channel_id, cleared_before_timestamp) 
+                     VALUES (?, ?, ?, datetime("now"))''', 
                  (user_session_id, server_id, channel_id))
-        
         conn.commit()
         print(f"[DEBUG] User {user_session_id} cleared chat for channel {channel} in server {server}", flush=True)
         
-        # Broadcast chat cleared to all users in this channel so everyone sees the empty chat
-        emit('chat_cleared', room=f'{server}:{channel}')
+        # Send confirmation back to the client only
+        emit('chat_cleared')
     conn.close()
 
 if __name__ == '__main__':
