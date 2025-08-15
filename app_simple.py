@@ -658,10 +658,23 @@ def handle_clear_chat():
     conn.close()
 
 if __name__ == '__main__':
+    import socket
+    def get_ip():
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            # doesn't even have to be reachable
+            s.connect(('10.255.255.255', 1))
+            IP = s.getsockname()[0]
+        except Exception:
+            IP = '127.0.0.1'
+        finally:
+            s.close()
+        return IP
+    
     print("🚀 Starting Real-time Chat Application...")
     print("=" * 50)
     print("📱 Local access: http://localhost:5000")
-    print("🌐 Network access: http://192.168.71.243:5000")
+    print(f"🌐 Network access: http://{get_ip()}:5000")  # ← This line now uses dynamic IP
     print("💡 Share the network URL with friends on the same WiFi")
     print("=" * 50)
-    socketio.run(app, debug=True, host='0.0.0.0', port=5000) 
+    socketio.run(app, debug=True, host='0.0.0.0', port=5000)
