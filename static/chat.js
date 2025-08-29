@@ -16,6 +16,11 @@ socket.on('connect', () => {
     console.log(`[DEBUG] Emitting join_server for server: ${currentServer}`);
     socket.emit('join_server', { server: currentServer });
   }
+  // Also immediately join the last known channel (if any) to ensure server-side session is ready for sending
+  if (currentServer && currentChannel) {
+    console.log(`[DEBUG] Emitting join_channel on connect for channel: ${currentChannel}`);
+    socket.emit('join_channel', { server: currentServer, channel: currentChannel });
+  }
 });
 
 // DOM elements
@@ -75,6 +80,57 @@ let myStatus = '';
 // Buffer to hold messages received before session info is set
 let messageBuffer = [];
 let sessionReady = false;
+
+// Fast-switch optimizations: persist per-channel history and last channel per server
+const HISTORY_KEY = 'messageHistoryV1';
+const LAST_CHANNELS_KEY = 'lastChannelsByServer';
+
+function loadPersistedHistory() {
+  try {
+    const raw = localStorage.getItem(HISTORY_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === 'object') {
+        messageHistory = parsed;
+      }
+    }
+  } catch (e) {
+    // ignore
+  }
+}
+
+function persistHistory() {
+  try {
+    localStorage.setItem(HISTORY_KEY, JSON.stringify(messageHistory));
+  } catch (e) {
+    // ignore
+  }
+}
+
+function getLastChannelForServer(server) {
+  try {
+    const map = JSON.parse(localStorage.getItem(LAST_CHANNELS_KEY) || '{}');
+    return map[server] || null;
+  } catch (e) {
+    return null;
+  }
+}
+
+function setLastChannelForServer(server, channel) {
+  try {
+    const map = JSON.parse(localStorage.getItem(LAST_CHANNELS_KEY) || '{}');
+    map[server] = channel;
+    localStorage.setItem(LAST_CHANNELS_KEY, JSON.stringify(map));
+  } catch (e) {
+    // ignore
+  }
+}
+
+// Render performance tuning
+const MAX_RENDERED_MESSAGES = 100; // render the most recent N messages for instant switching
+let userStatusMap = new Map(); // cache user status for O(1) lookups when rendering
+// Reactions map must be defined before any initial rendering occurs
+let messageReactions = {};
 
 // Reply state management
 let currentReply = null; // { msgId, username, avatar, text }
@@ -160,11 +216,14 @@ function renderChannels(channels) {
     if (currentChannel !== channel) {
       currentChannel = channel;
       localStorage.setItem('currentChannel', currentChannel);
+      setLastChannelForServer(currentServer, currentChannel);
       socket.emit('join_channel', { server: currentServer, channel });
       renderChannels(channels);
-      messagesDiv.innerHTML = '';
       chatHeader.textContent = `${currentServer} / #${channel}`;
       chatForm.style.display = '';
+      // Immediately render any cached messages for this channel
+      const existing = getMessageHistoryForCurrentChannel();
+      renderMessages(existing);
       // Clear typing indicators when switching channels
       typingUsers.clear();
       updateTypingIndicator();
@@ -236,40 +295,35 @@ socket.on('session', data => {
   if (messageBuffer.length > 0) {
     const currentMessages = getMessageHistoryForCurrentChannel();
     // Add buffered messages to currentMessages, avoiding duplicates
-    messageBuffer.forEach(data => {
-      const self = data.username === myUsername && data.avatar === myAvatar;
-      const existingIndex = currentMessages.findIndex(msg => msg.id === data.id || (self && msg.id === data.tempId));
+    messageBuffer.forEach(m => {
+      const selfMsg = m.username === myUsername && m.avatar === myAvatar;
+      const existingIndex = currentMessages.findIndex(msg => msg.id === m.id || (selfMsg && msg.id === m.tempId));
       if (existingIndex !== -1) {
         currentMessages.splice(existingIndex, 1);
       }
-      currentMessages.push({
-        username: data.username,
-        avatar: data.avatar,
-        text: data.msg,
-        self,
-        id: data.id,
-        timestamp: data.timestamp,
-        status: data.status || '',
-        reactions: data.reactions || {}
-      });
-
-            // Add reply data if present from server
-      if (data.replyTo && data.replyTo.id) {
+      const messageObj = {
+        username: m.username,
+        avatar: m.avatar,
+        text: m.msg,
+        self: selfMsg,
+        id: m.id,
+        timestamp: m.timestamp,
+        status: m.status || '',
+        reactions: m.reactions || {}
+      };
+      // Add reply/thread data if present
+      if (m.reply_to_id && m.reply_to_text && m.reply_to_username && m.reply_to_avatar) {
         messageObj.replyTo = {
-          id: data.replyTo.id,
-          text: data.replyTo.text,
-          username: data.replyTo.username,
-          avatar: data.replyTo.avatar
+          id: m.reply_to_id,
+          text: m.reply_to_text,
+          username: m.reply_to_username,
+          avatar: m.reply_to_avatar
         };
       }
-      
-      if (data.threadId) {
-        messageObj.threadId = data.threadId;
+      if (m.thread_id) {
+        messageObj.threadId = m.thread_id;
       }
-      
       currentMessages.push(messageObj);
-
-
     });
     setMessageHistoryForCurrentChannel(currentMessages);
     renderMessages(currentMessages);
@@ -304,6 +358,9 @@ socket.on('channel_list', data => {
   if (currentChannel && data.channels.includes(currentChannel)) {
     chatHeader.textContent = `${currentServer} / #${currentChannel}`;
     chatForm.style.display = '';
+    // Immediately render any cached messages for this channel
+    const existing = getMessageHistoryForCurrentChannel();
+    renderMessages(existing);
     console.log(`[DEBUG] Emitting join_channel for channel: ${currentChannel}`);
     socket.emit('join_channel', { server: currentServer, channel: currentChannel });
   } else if (data.channels.length > 0) {
@@ -311,6 +368,9 @@ socket.on('channel_list', data => {
     localStorage.setItem('currentChannel', currentChannel);
     chatHeader.textContent = `${currentServer} / #${currentChannel}`;
     chatForm.style.display = '';
+    // Immediately render any cached messages for this channel
+    const existing = getMessageHistoryForCurrentChannel();
+    renderMessages(existing);
     console.log(`[DEBUG] Emitting join_channel for new channel: ${currentChannel}`);
     socket.emit('join_channel', { server: currentServer, channel: currentChannel });
   }
@@ -373,12 +433,14 @@ function updateTypingIndicator() {
 let latestUserList = [];
 socket.on('user_list', data => {
   latestUserList = data.users;
+  // Build a fast lookup map for statuses
+  userStatusMap = new Map(data.users.map(u => [u.username + '|' + u.avatar, { online: u.online, last_seen: u.last_seen }]));
   renderUserList(data.users);
 });
 
 function getUserStatus(username, avatar) {
-  const user = latestUserList.find(u => u.username === username && u.avatar === avatar);
-  return user ? { online: user.online, last_seen: user.last_seen } : { online: false, last_seen: null };
+  const rec = userStatusMap.get(username + '|' + avatar);
+  return rec ? { online: rec.online, last_seen: rec.last_seen } : { online: false, last_seen: null };
 }
 
 socket.on('profile_updated', data => {
@@ -670,26 +732,36 @@ function fallbackCopyText(msg) {
 
 // Message grouping
 function renderMessages(messageList) {
-  messagesDiv.innerHTML = '';
+  const list = messageList && messageList.length > MAX_RENDERED_MESSAGES
+    ? messageList.slice(-MAX_RENDERED_MESSAGES)
+    : (messageList || []);
+  const frag = document.createDocumentFragment();
   let lastUser = null;
   let groupDiv = null;
-  messageList.forEach((msg, i) => {
+  list.forEach((msg) => {
     const isSameUser = lastUser && msg.username === lastUser.username && msg.avatar === lastUser.avatar;
     if (!isSameUser) {
       groupDiv = document.createElement('div');
-      groupDiv.className = 'chat-message-group fade-in';
-      messagesDiv.appendChild(groupDiv);
+      groupDiv.className = 'chat-message-group';
+      frag.appendChild(groupDiv);
     }
     const messageDiv = createMessageDiv(msg.username, msg.avatar, msg.text, msg.self, msg.id, msg.timestamp, msg.status, msg.reactions, msg.replyTo, msg.threadId);
     if (groupDiv) groupDiv.appendChild(messageDiv);
     lastUser = msg;
   });
+  messagesDiv.replaceChildren(frag);
   messagesDiv.scrollTop = messagesDiv.scrollHeight;
 }
 
 // Store messages for grouping
 // Store messages per channel for grouping
 let messageHistory = {};
+loadPersistedHistory();
+// On initial load, render instantly from cache if available
+const _initialMsgs = getMessageHistoryForCurrentChannel();
+if (_initialMsgs && _initialMsgs.length) {
+  renderMessages(_initialMsgs);
+}
 
 function getCurrentChannelKey() {
   return currentServer && currentChannel ? `${currentServer}:${currentChannel}` : null;
@@ -706,12 +778,14 @@ function setMessageHistoryForCurrentChannel(messages) {
   const key = getCurrentChannelKey();
   if (!key) return;
   messageHistory[key] = messages;
+  persistHistory();
 }
 
 function clearMessageHistoryForCurrentChannel() {
   const key = getCurrentChannelKey();
   if (!key) return;
   messageHistory[key] = [];
+  persistHistory();
 }
 
 socket.on('message', data => {
@@ -731,8 +805,8 @@ socket.on('message', data => {
     currentMessages.splice(existingIndex, 1);
   }
 
-  // Add message
-  currentMessages.push({
+  // Add message (build once, then push)
+  const messageObj = {
     username: data.username,
     avatar: data.avatar,
     text: data.msg,
@@ -741,9 +815,8 @@ socket.on('message', data => {
     timestamp: data.timestamp,
     status: data.status || '',
     reactions: data.reactions || {}
-  });
-
-    // Add reply data if present
+  };
+  // Add reply/thread data if present
   if (data.reply_to_id && data.reply_to_text && data.reply_to_username && data.reply_to_avatar) {
     messageObj.replyTo = {
       id: data.reply_to_id,
@@ -752,11 +825,9 @@ socket.on('message', data => {
       avatar: data.reply_to_avatar
     };
   }
-  
   if (data.thread_id) {
     messageObj.threadId = data.thread_id;
   }
-
   currentMessages.push(messageObj);
   setMessageHistoryForCurrentChannel(currentMessages);
   renderMessages(currentMessages);
@@ -804,7 +875,6 @@ socket.on('reactions_update', data => {
 const DEFAULT_REACTIONS = ['👍', '😂', '😊', '🔥', '😮', '😢', '🎉', '❤️'];
 
 // Track reactions for each message
-let messageReactions = {};
 
 function createReactionsBar(msgId, reactions) {
   const bar = document.createElement('div');
@@ -945,7 +1015,7 @@ function createMessageDiv(username, avatar, msg, self = false, msgId = null, tim
   div.style.display = 'flex';
   div.style.alignItems = 'center';
   div.style.gap = '0.5rem';
-  div.className = 'chat-message fade-in';
+  div.className = 'chat-message';
 
   // If this is a reply, show the quoted message with reply indicator
   if (replyTo) {
@@ -1189,16 +1259,35 @@ function renderServers(servers) {
       if (currentServer !== server) {
         currentServer = server;
         localStorage.setItem('currentServer', currentServer);
-        currentChannel = null;
-        localStorage.removeItem('currentChannel');
+
+        // Try to restore last channel for this server immediately
+        const remembered = getLastChannelForServer(server);
+        if (remembered) {
+          currentChannel = remembered;
+          localStorage.setItem('currentChannel', currentChannel);
+        } else {
+          currentChannel = null;
+          localStorage.removeItem('currentChannel');
+        }
+
         socket.emit('join_server', { server });
         renderServers(servers);
-        messageHistory = [];
-        messagesDiv.innerHTML = '';
-        chatHeader.textContent = 'Select a channel';
-        chatForm.style.display = 'none';
-        channelList.innerHTML = '';
-        userListDiv.innerHTML = '';
+
+        if (currentChannel) {
+          chatHeader.textContent = `${currentServer} / #${currentChannel}`;
+          chatForm.style.display = '';
+          // Instantly render cached messages for this server/channel
+          const existing = getMessageHistoryForCurrentChannel();
+          renderMessages(existing);
+          // Also proactively join channel to start receiving realtime + history
+          socket.emit('join_channel', { server, channel: currentChannel });
+        } else {
+          chatHeader.textContent = 'Select a channel';
+          chatForm.style.display = 'none';
+          channelList.innerHTML = '';
+          userListDiv.innerHTML = '';
+        }
+
         // Clear typing indicators when switching servers
         typingUsers.clear();
         updateTypingIndicator();
