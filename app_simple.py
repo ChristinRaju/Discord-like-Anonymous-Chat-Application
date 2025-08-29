@@ -275,14 +275,30 @@ def handle_join_channel(data):
         if row:
             channel_id = row[0]
 
-            # Get user session ID for cleared message filtering
-            user_session_id = flask_session.get('user_session_id', sid)
-            
-            # Check if user has cleared messages for this channel
-            c.execute('SELECT cleared_before_timestamp FROM user_cleared_messages WHERE user_session_id=? AND server_id=? AND channel_id=?', 
-                     (user_session_id, server_id, channel_id))
-            cleared_row = c.fetchone()
-            cleared_before_timestamp = cleared_row[0] if cleared_row else None
+            # Get username and avatar for cleared message filtering
+            current_username = user_sessions[sid]['username']
+            current_avatar = user_sessions[sid]['avatar']
+
+            # Determine a stable key for per-user clears: prefer Flask session id, fallback to username:avatar
+            user_session_key = flask_session.get('user_session_id')
+            fallback_key = f"{current_username}:{current_avatar}"
+            cleared_before_timestamp = None
+
+            # Try session-based key first
+            if user_session_key:
+                c.execute('SELECT cleared_before_timestamp FROM user_cleared_messages WHERE user_session_id=? AND server_id=? AND channel_id=?',
+                          (user_session_key, server_id, channel_id))
+                row_session = c.fetchone()
+                if row_session:
+                    cleared_before_timestamp = row_session[0]
+
+            # Fallback to username:avatar based key if no session-based clear found
+            if not cleared_before_timestamp:
+                c.execute('SELECT cleared_before_timestamp FROM user_cleared_messages WHERE user_session_id=? AND server_id=? AND channel_id=?',
+                          (fallback_key, server_id, channel_id))
+                row_fallback = c.fetchone()
+                if row_fallback:
+                    cleared_before_timestamp = row_fallback[0]
 
             if cleared_before_timestamp:
                 # Only load messages after the cleared timestamp
@@ -293,12 +309,11 @@ def handle_join_channel(data):
                 c.execute('SELECT id, username, avatar, text, timestamp FROM messages WHERE server_id=? AND channel_id=? ORDER BY id DESC LIMIT 50', 
                          (server_id, channel_id))
 
-            #c.execute('SELECT id, username, avatar, text, timestamp FROM messages WHERE server_id=? AND channel_id=? ORDER BY id DESC LIMIT 50', (server_id, channel_id))
             messages = c.fetchall()[::-1]  # reverse to chronological order
-            for msg_id, username, avatar, text, timestamp in messages:
+            for msg_id, msg_username, msg_avatar, text, timestamp in messages:
                 # Lookup status for each user
                 c2 = conn.cursor()
-                c2.execute('SELECT status FROM users WHERE username=? AND avatar=?', (username, avatar))
+                c2.execute('SELECT status FROM users WHERE username=? AND avatar=?', (msg_username, msg_avatar))
                 status_row = c2.fetchone()
                 status = status_row[0] if status_row else ''
                 # Get reactions
@@ -309,7 +324,7 @@ def handle_join_channel(data):
                     if emoji not in reactions:
                         reactions[emoji] = []
                     reactions[emoji].append({'username': uname, 'avatar': av})
-                emit('message', {'msg': text, 'username': username, 'avatar': avatar, 'id': msg_id, 'timestamp': timestamp, 'status': status, 'reactions': reactions})
+                emit('message', {'msg': text, 'username': msg_username, 'avatar': msg_avatar, 'id': msg_id, 'timestamp': timestamp, 'status': status, 'reactions': reactions})
         conn.close()
         update_user_list(server)
         broadcast_pinned_messages(server, channel)
@@ -629,32 +644,35 @@ def handle_delete_server(data):
 
 @socketio.on('clear_chat')
 def handle_clear_chat():
-    from flask import session as flask_session
+    # Make clear chat GLOBAL for the channel: delete all messages, reactions, and pinned entries
     sid = request.sid
     server = user_sessions[sid]['server']
     channel = user_sessions[sid]['channel']
     if not (server and channel):
         return
-        
+
     server_id = servers[server]['id']
-    user_session_id = flask_session.get('user_session_id', sid)
-    
+
     conn = sqlite3.connect('chat.db')
     c = conn.cursor()
     c.execute('SELECT id FROM channels WHERE name=? AND server_id=?', (channel, server_id))
     row = c.fetchone()
     if row:
         channel_id = row[0]
-        # Record the current timestamp as the clear point for this user
-        c.execute('''INSERT OR REPLACE INTO user_cleared_messages 
-                     (user_session_id, server_id, channel_id, cleared_before_timestamp) 
-                     VALUES (?, ?, ?, datetime("now"))''', 
-                 (user_session_id, server_id, channel_id))
+        # Delete reactions for all messages in this channel
+        c.execute('DELETE FROM reactions WHERE message_id IN (SELECT id FROM messages WHERE server_id=? AND channel_id=?)', (server_id, channel_id))
+        # Delete pinned messages records for this channel
+        c.execute('DELETE FROM pinned_messages WHERE channel_id=?', (channel_id,))
+        # Delete all messages in this channel
+        c.execute('DELETE FROM messages WHERE server_id=? AND channel_id=?', (server_id, channel_id))
+        # Remove any per-user clear records for this channel (no longer needed once globally cleared)
+        c.execute('DELETE FROM user_cleared_messages WHERE server_id=? AND channel_id=?', (server_id, channel_id))
         conn.commit()
-        print(f"[DEBUG] User {user_session_id} cleared chat for channel {channel} in server {server}", flush=True)
-        
-        # Send confirmation back to the client only
-        emit('chat_cleared')
+        print(f"[DEBUG] Globally cleared chat for server={server}, channel={channel}", flush=True)
+        # Broadcast to everyone in this channel so all UIs clear immediately
+        emit('chat_cleared', room=f'{server}:{channel}')
+        # Update pinned bar for everyone (now empty)
+        broadcast_pinned_messages(server, channel)
     conn.close()
 
 if __name__ == '__main__':
