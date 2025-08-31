@@ -73,7 +73,7 @@
     <div class="channels" id="channel-list">
       <!-- Channels will be rendered here -->
     </div>
-    <div class="chat-section">
+    <div class="chat-section" style="position:relative;">
       <div class="pinned-bar" id="pinned-bar"></div>
       <div style="display: flex; align-items: center; justify-content: space-between; padding: 1rem; border-bottom: 1px solid #23272a; color: #fff; font-size: 1.1rem;">
         <div id="chat-header">Select a channel</div>
@@ -81,10 +81,15 @@
       </div>
       <div class="chat-messages" id="messages"></div>
       <div class="typing" id="typing-indicator" style="display:none;"></div>
+      <div id="attachment-preview" style="display:none; padding: 0 1rem 0.5rem 1rem;"></div>
       <form class="chat-form" id="chat-form" style="display:none;">
         <input class="chat-input" id="message-input" autocomplete="off" placeholder="Type a message..." />
+        <button id="upload-btn" class="btn" type="button" title="Attach file">📎</button>
+        <input id="file-input" type="file" style="display:none" accept="image/*,.pdf,.txt,.md,.csv,.json,.zip,.tar,.gz,.7z,.doc,.docx,.ppt,.pptx,.xls,.xlsx" />
+        <button id="emoji-btn" class="btn" type="button" title="Pick emoji">😊</button>
         <button class="btn" type="submit">Send</button>
       </form>
+      <div id="emoji-picker" style="display:none; position:absolute; bottom:70px; right:16px; width:595px; height:433px; box-sizing:border-box; background:#000; border:1px solid #23272a; border-radius:10px; padding:12px; overflow:hidden; z-index:999;"></div>
     </div>
     <div class="user-list" id="user-list">
       <!-- User list will be rendered here -->
