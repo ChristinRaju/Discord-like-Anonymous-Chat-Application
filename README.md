@@ -67,8 +67,8 @@ A feature-rich, real-time chat application inspired by Discord, built with Flask
 1. **Clone or download the project**
    ```bash
    # If you have git installed
-   git clone <your-repo-url>
-   cd anonymous-feedback-app
+   git clone https://github.com/ChristinRaju/Discord-like-Anonymous-Chat-Application.git
+   cd Discord-like-Anonymous-Chat-Application
    ```
 
 2. **Install dependencies**
@@ -149,7 +149,7 @@ start_chat.bat
 ## 🔧 Configuration Options
 
 ### Port Configuration
-Edit `app.py` line 580 to change the default port:
+In `app.py`, find the socketio.run(...) line and change the port as needed:
 ```python
 socketio.run(app, debug=True, host='0.0.0.0', port=5000)  # Change 5000 to your preferred port
 ```
